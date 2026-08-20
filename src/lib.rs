@@ -5,3 +5,6 @@
 #![forbid(unsafe_code)]
 
 pub mod leb;
+pub mod types;
+
+pub use types::{FuncType, Val, ValType};
