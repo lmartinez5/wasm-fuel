@@ -9,4 +9,4 @@ pub mod parse;
 pub mod types;
 
 pub use parse::{parse, Module, ParseError, ParseErrorKind};
-pub use types::{FuncType, Val, ValType};
+pub use types::{Export, ExternKind, Func, FuncType, Import, ImportDesc, Val, ValType};

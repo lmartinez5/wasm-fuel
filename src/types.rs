@@ -83,6 +83,73 @@ impl fmt::Display for FuncType {
     }
 }
 
+/// The kind of thing an import or export refers to.
+///
+/// Only `Func` carries any further detail elsewhere in this crate (a type
+/// index for an import, a function index for an export) - tables, memories
+/// and globals are recorded so that indices and byte offsets stay correct,
+/// but nothing past that, since this crate never gives guest code any of the
+/// three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternKind {
+    Func,
+    Table,
+    Memory,
+    Global,
+}
+
+impl ExternKind {
+    /// Decodes the single byte the binary format uses to tag an import or
+    /// export description.
+    pub fn from_byte(byte: u8) -> Option<ExternKind> {
+        match byte {
+            0x00 => Some(ExternKind::Func),
+            0x01 => Some(ExternKind::Table),
+            0x02 => Some(ExternKind::Memory),
+            0x03 => Some(ExternKind::Global),
+            _ => None,
+        }
+    }
+}
+
+/// What a single import provides. A function import carries the type index
+/// it was declared with, since that is what lets a call through the function
+/// index space resolve to a signature; table, memory and global imports have
+/// nothing else worth keeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportDesc {
+    Func(u32),
+    Table,
+    Memory,
+    Global,
+}
+
+/// A single entry from the import section: `module.name` and what it must
+/// provide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Import {
+    pub module: String,
+    pub name: String,
+    pub desc: ImportDesc,
+}
+
+/// A locally defined function, as declared in the function section: just the
+/// type index for now. Locals and the instruction bytes arrive with the code
+/// section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Func {
+    pub type_idx: u32,
+}
+
+/// A single entry from the export section: the name it is visible under,
+/// what kind of thing it is, and its index within that kind's index space.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Export {
+    pub name: String,
+    pub kind: ExternKind,
+    pub index: u32,
+}
+
 /// A runtime value: an operand on the interpreter's value stack, a local, or
 /// an argument or result of a call.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -118,6 +185,15 @@ mod tests {
         assert_eq!(ValType::from_byte(0x7C), Some(ValType::F64));
         assert_eq!(ValType::from_byte(0x70), None); // funcref, not accepted
         assert_eq!(ValType::from_byte(0x00), None);
+    }
+
+    #[test]
+    fn decodes_extern_kind_bytes() {
+        assert_eq!(ExternKind::from_byte(0x00), Some(ExternKind::Func));
+        assert_eq!(ExternKind::from_byte(0x01), Some(ExternKind::Table));
+        assert_eq!(ExternKind::from_byte(0x02), Some(ExternKind::Memory));
+        assert_eq!(ExternKind::from_byte(0x03), Some(ExternKind::Global));
+        assert_eq!(ExternKind::from_byte(0x04), None);
     }
 
     #[test]

@@ -5,16 +5,16 @@
 //! `(id, size, content)` sections; `parse` walks that sequence once, checking
 //! the ordering rule (known section ids must strictly increase; custom
 //! sections are exempt and may appear anywhere, any number of times) and
-//! handing each section's bytes to whatever understands that id. Only the
-//! type section has a real parser so far - everything else with a known id
-//! is skipped by length and recorded in `skipped_sections`, which is also
-//! where table/memory/global/element/data/data-count sections will stay
+//! handing each section's bytes to whatever understands that id. Type,
+//! import, function, export and start sections have real parsers; the code
+//! section is still skipped by length for now, and table/memory/global/
+//! element/data/data-count sections will stay in `skipped_sections`
 //! permanently, since this crate never gives guest code memory or tables.
 
 use std::fmt;
 
 use crate::leb::{self, LebError};
-use crate::types::{FuncType, ValType};
+use crate::types::{Export, ExternKind, Func, FuncType, Import, ImportDesc, ValType};
 
 /// The maximum section id defined by the binary format (the data-count
 /// section added for bulk memory). Anything past this is not a section this
@@ -26,20 +26,84 @@ const FUNC_TYPE_TAG: u8 = 0x60;
 
 /// A decoded WebAssembly module.
 ///
-/// Fields fill in as the parser grows; right now only `types` reflects real
-/// section content; imports, functions, exports, start and code all arrive
-/// as their sections get parsers of their own.
+/// Fields fill in as the parser grows; code section bodies (locals and
+/// instruction bytes) are still missing, so `funcs` only carries each local
+/// function's type index so far.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Module {
     /// The type section: every function signature the module declares or
     /// refers to, indexed by type index.
     pub types: Vec<FuncType>,
+    /// The import section, in declaration order.
+    pub imports: Vec<Import>,
+    /// The function section: the type index of each locally defined
+    /// function, in declaration order. Function indices count imported
+    /// functions first, then these.
+    pub funcs: Vec<Func>,
+    /// The export section, in declaration order.
+    pub exports: Vec<Export>,
+    /// The start function's index, if the module declares one.
+    pub start: Option<u32>,
     /// The name of each custom section, in the order it appeared. Custom
     /// section contents are not otherwise interpreted.
     pub custom_sections: Vec<String>,
     /// The id of each known, non-custom section that was skipped rather than
     /// parsed, in the order it appeared.
     pub skipped_sections: Vec<u8>,
+}
+
+impl Module {
+    /// How many entries at the start of the function index space are
+    /// imports rather than locally defined functions.
+    pub fn imported_func_count(&self) -> usize {
+        self.imports.iter().filter(|i| matches!(i.desc, ImportDesc::Func(_))).count()
+    }
+
+    /// The signature of the function at `index` in the function index space
+    /// (imported functions first, then local ones), if `index` names a
+    /// function and its type index is in range.
+    pub fn func_type(&self, index: u32) -> Option<&FuncType> {
+        let index = index as usize;
+        let imported = self.imported_func_count();
+        let type_idx = if index < imported {
+            self.imports
+                .iter()
+                .filter_map(|i| match i.desc {
+                    ImportDesc::Func(t) => Some(t),
+                    _ => None,
+                })
+                .nth(index)?
+        } else {
+            self.funcs.get(index - imported)?.type_idx
+        };
+        self.types.get(type_idx as usize)
+    }
+
+    /// The function index exported under `name`, if `name` names a function
+    /// export.
+    pub fn export_func(&self, name: &str) -> Option<u32> {
+        self.exports
+            .iter()
+            .find(|e| e.kind == ExternKind::Func && e.name == name)
+            .map(|e| e.index)
+    }
+
+    /// One human-readable line per export, in declaration order, e.g.
+    /// `"func square: (i32) -> i32"`.
+    pub fn describe_exports(&self) -> Vec<String> {
+        self.exports
+            .iter()
+            .map(|e| match e.kind {
+                ExternKind::Func => match self.func_type(e.index) {
+                    Some(t) => format!("func {}: {t}", e.name),
+                    None => format!("func {}: <type index out of range>", e.name),
+                },
+                ExternKind::Table => format!("table {}", e.name),
+                ExternKind::Memory => format!("memory {}", e.name),
+                ExternKind::Global => format!("global {}", e.name),
+            })
+            .collect()
+    }
 }
 
 /// The four bytes that open every WebAssembly binary: `\0asm`.
@@ -84,8 +148,17 @@ pub enum ParseErrorKind {
     InvalidValType(u8),
     /// A function type did not start with `0x60`.
     InvalidFuncType(u8),
+    /// An import or export description's kind byte was none of `0x00`
+    /// (func), `0x01` (table), `0x02` (memory), `0x03` (global).
+    InvalidExternKind(u8),
+    /// A table or memory limits' flag byte was neither `0x00` (min only) nor
+    /// `0x01` (min and max).
+    InvalidLimits,
     /// A custom section's name was not valid UTF-8.
     InvalidUtf8,
+    /// A type index named by an import or the function section named a type
+    /// that does not exist.
+    TypeIndexOutOfRange(u32),
 }
 
 impl fmt::Display for ParseErrorKind {
@@ -106,7 +179,14 @@ impl fmt::Display for ParseErrorKind {
             ParseErrorKind::InvalidFuncType(byte) => {
                 write!(f, "invalid function type tag {byte:#04x} (expected 0x60)")
             }
+            ParseErrorKind::InvalidExternKind(byte) => {
+                write!(f, "invalid import/export kind byte {byte:#04x}")
+            }
+            ParseErrorKind::InvalidLimits => {
+                f.write_str("invalid limits flag byte (expected 0x00 or 0x01)")
+            }
             ParseErrorKind::InvalidUtf8 => f.write_str("custom section name is not valid UTF-8"),
+            ParseErrorKind::TypeIndexOutOfRange(idx) => write!(f, "type index {idx} is out of range"),
         }
     }
 }
@@ -154,8 +234,9 @@ pub fn parse_header(bytes: &[u8]) -> Result<usize, ParseError> {
 /// loop. Known section ids (1 through `MAX_KNOWN_SECTION_ID`) must strictly
 /// increase from one section to the next, which also forbids repeating one;
 /// custom sections (id 0) are exempt and may appear anywhere, any number of
-/// times. Only the type section is actually decoded; every other known id is
-/// skipped by length and recorded in `Module::skipped_sections`.
+/// times. Type, import, function, export and start sections are decoded;
+/// every other known id is skipped by length and recorded in
+/// `Module::skipped_sections`.
 pub fn parse(bytes: &[u8]) -> Result<Module, ParseError> {
     let mut pos = parse_header(bytes)?;
     let mut module = Module::default();
@@ -187,10 +268,13 @@ pub fn parse(bytes: &[u8]) -> Result<Module, ParseError> {
                     return Err(ParseError { offset: section_start, kind: ParseErrorKind::SectionOutOfOrder });
                 }
                 last_known_id = Some(id);
-                if id == 1 {
-                    module.types = parse_type_section(body, body_start)?;
-                } else {
-                    module.skipped_sections.push(id);
+                match id {
+                    1 => module.types = parse_type_section(body, body_start)?,
+                    2 => module.imports = parse_import_section(body, body_start, &module.types)?,
+                    3 => module.funcs = parse_function_section(body, body_start, &module.types)?,
+                    7 => module.exports = parse_export_section(body, body_start)?,
+                    8 => module.start = Some(parse_start_section(body, body_start)?),
+                    _ => module.skipped_sections.push(id),
                 }
             }
             other => {
@@ -211,6 +295,33 @@ fn read_u32_at(bytes: &[u8], pos: &mut usize, base: usize) -> Result<u32, ParseE
     leb::read_u32(bytes, pos).map_err(|e| ParseError { offset: base + *pos, kind: ParseErrorKind::Leb(e) })
 }
 
+/// Reads a single byte at `*pos`, advancing past it, or reports the absolute
+/// offset (`base + *pos`) as `UnexpectedEof`.
+fn read_byte(bytes: &[u8], pos: &mut usize, base: usize) -> Result<u8, ParseError> {
+    let offset = base + *pos;
+    let byte = *bytes.get(*pos).ok_or(ParseError { offset, kind: ParseErrorKind::UnexpectedEof })?;
+    *pos += 1;
+    Ok(byte)
+}
+
+/// Reads a `limits`: a flag byte (`0x00` min-only, `0x01` min and max)
+/// followed by one or two `u32`s. Used by table and memory import types;
+/// the values themselves are not kept since this crate gives guest code
+/// neither tables nor memory.
+fn read_limits(bytes: &[u8], pos: &mut usize, base: usize) -> Result<(), ParseError> {
+    let flag_offset = base + *pos;
+    let flag = read_byte(bytes, pos, base)?;
+    read_u32_at(bytes, pos, base)?; // min
+    match flag {
+        0x00 => Ok(()),
+        0x01 => {
+            read_u32_at(bytes, pos, base)?; // max
+            Ok(())
+        }
+        _ => Err(ParseError { offset: flag_offset, kind: ParseErrorKind::InvalidLimits }),
+    }
+}
+
 /// Decodes the type section: `vec(functype)`, where each `functype` is
 /// `0x60 vec(valtype) vec(valtype)` (parameters, then results).
 fn parse_type_section(body: &[u8], base: usize) -> Result<Vec<FuncType>, ParseError> {
@@ -220,10 +331,7 @@ fn parse_type_section(body: &[u8], base: usize) -> Result<Vec<FuncType>, ParseEr
 
     for _ in 0..count {
         let tag_offset = base + pos;
-        let tag = *body
-            .get(pos)
-            .ok_or(ParseError { offset: tag_offset, kind: ParseErrorKind::UnexpectedEof })?;
-        pos += 1;
+        let tag = read_byte(body, &mut pos, base)?;
         if tag != FUNC_TYPE_TAG {
             return Err(ParseError { offset: tag_offset, kind: ParseErrorKind::InvalidFuncType(tag) });
         }
@@ -232,8 +340,7 @@ fn parse_type_section(body: &[u8], base: usize) -> Result<Vec<FuncType>, ParseEr
         types.push(FuncType { params, results });
     }
 
-    // The type section is the one section this parser fully understands, so
-    // it is also the one place it can catch a size field that lied: if the
+    // A fully understood section can catch a size field that lied: if the
     // declared count of types did not consume exactly `size` bytes, the file
     // is malformed even though every individual value decoded cleanly.
     if pos != body.len() {
@@ -248,11 +355,129 @@ fn read_val_type_vec(body: &[u8], pos: &mut usize, base: usize) -> Result<Vec<Va
     let mut out = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let offset = base + *pos;
-        let byte = *body.get(*pos).ok_or(ParseError { offset, kind: ParseErrorKind::UnexpectedEof })?;
-        *pos += 1;
+        let byte = read_byte(body, pos, base)?;
         out.push(ValType::from_byte(byte).ok_or(ParseError { offset, kind: ParseErrorKind::InvalidValType(byte) })?);
     }
     Ok(out)
+}
+
+/// Decodes the import section: `vec(import)`, where each `import` is
+/// `mod:name name:name desc:importdesc`. `importdesc` starts with a kind byte
+/// (func/table/memory/global) that determines what follows: a type index for
+/// a function, a table type or limits for a table or memory, a value type
+/// and mutability flag for a global. Only the function case keeps its
+/// payload - `types` is passed in so a function import's type index can be
+/// checked against it immediately, the same way the function section checks
+/// its own type indices.
+fn parse_import_section(body: &[u8], base: usize, types: &[FuncType]) -> Result<Vec<Import>, ParseError> {
+    let mut pos = 0;
+    let count = read_u32_at(body, &mut pos, base)?;
+    let mut imports = Vec::with_capacity(count as usize);
+
+    for _ in 0..count {
+        let module = read_name(body, &mut pos, base)?;
+        let name = read_name(body, &mut pos, base)?;
+        let kind_offset = base + pos;
+        let kind_byte = read_byte(body, &mut pos, base)?;
+        let desc = match kind_byte {
+            0x00 => {
+                let idx_offset = base + pos;
+                let type_idx = read_u32_at(body, &mut pos, base)?;
+                if type_idx as usize >= types.len() {
+                    return Err(ParseError { offset: idx_offset, kind: ParseErrorKind::TypeIndexOutOfRange(type_idx) });
+                }
+                ImportDesc::Func(type_idx)
+            }
+            0x01 => {
+                // Table type: a reftype byte (funcref or externref) that this
+                // crate never inspects, since it never gives guest code a
+                // table either way, then limits.
+                read_byte(body, &mut pos, base)?;
+                read_limits(body, &mut pos, base)?;
+                ImportDesc::Table
+            }
+            0x02 => {
+                read_limits(body, &mut pos, base)?;
+                ImportDesc::Memory
+            }
+            0x03 => {
+                let valtype_offset = base + pos;
+                let valtype_byte = read_byte(body, &mut pos, base)?;
+                ValType::from_byte(valtype_byte)
+                    .ok_or(ParseError { offset: valtype_offset, kind: ParseErrorKind::InvalidValType(valtype_byte) })?;
+                read_byte(body, &mut pos, base)?; // mutability flag, not kept
+                ImportDesc::Global
+            }
+            other => return Err(ParseError { offset: kind_offset, kind: ParseErrorKind::InvalidExternKind(other) }),
+        };
+        imports.push(Import { module, name, desc });
+    }
+
+    if pos != body.len() {
+        return Err(ParseError { offset: base + pos, kind: ParseErrorKind::SectionSizeMismatch });
+    }
+
+    Ok(imports)
+}
+
+/// Decodes the function section: `vec(typeidx)`, one entry per locally
+/// defined function, in the order the code section's bodies will match up
+/// with.
+fn parse_function_section(body: &[u8], base: usize, types: &[FuncType]) -> Result<Vec<Func>, ParseError> {
+    let mut pos = 0;
+    let count = read_u32_at(body, &mut pos, base)?;
+    let mut funcs = Vec::with_capacity(count as usize);
+
+    for _ in 0..count {
+        let idx_offset = base + pos;
+        let type_idx = read_u32_at(body, &mut pos, base)?;
+        if type_idx as usize >= types.len() {
+            return Err(ParseError { offset: idx_offset, kind: ParseErrorKind::TypeIndexOutOfRange(type_idx) });
+        }
+        funcs.push(Func { type_idx });
+    }
+
+    if pos != body.len() {
+        return Err(ParseError { offset: base + pos, kind: ParseErrorKind::SectionSizeMismatch });
+    }
+
+    Ok(funcs)
+}
+
+/// Decodes the export section: `vec(export)`, where each `export` is
+/// `name:name desc:exportdesc` and `exportdesc` is a kind byte followed by an
+/// index into that kind's index space.
+fn parse_export_section(body: &[u8], base: usize) -> Result<Vec<Export>, ParseError> {
+    let mut pos = 0;
+    let count = read_u32_at(body, &mut pos, base)?;
+    let mut exports = Vec::with_capacity(count as usize);
+
+    for _ in 0..count {
+        let name = read_name(body, &mut pos, base)?;
+        let kind_offset = base + pos;
+        let kind_byte = read_byte(body, &mut pos, base)?;
+        let kind = ExternKind::from_byte(kind_byte)
+            .ok_or(ParseError { offset: kind_offset, kind: ParseErrorKind::InvalidExternKind(kind_byte) })?;
+        let index = read_u32_at(body, &mut pos, base)?;
+        exports.push(Export { name, kind, index });
+    }
+
+    if pos != body.len() {
+        return Err(ParseError { offset: base + pos, kind: ParseErrorKind::SectionSizeMismatch });
+    }
+
+    Ok(exports)
+}
+
+/// Decodes the start section: a single `funcidx`, with no length prefix of
+/// its own beyond the section's.
+fn parse_start_section(body: &[u8], base: usize) -> Result<u32, ParseError> {
+    let mut pos = 0;
+    let index = read_u32_at(body, &mut pos, base)?;
+    if pos != body.len() {
+        return Err(ParseError { offset: base + pos, kind: ParseErrorKind::SectionSizeMismatch });
+    }
+    Ok(index)
 }
 
 /// Decodes a custom section's name: `vec(byte)` interpreted as UTF-8. Any
@@ -492,5 +717,157 @@ mod tests {
             parse(&bytes),
             Err(ParseError { offset: 8 + 3, kind: ParseErrorKind::InvalidUtf8 })
         );
+    }
+
+    #[test]
+    fn parses_a_function_import() {
+        let mut bytes = header();
+        bytes.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]); // type 0: () -> ()
+        // import section: id 2, one import "env"."log" of type 0
+        bytes.extend_from_slice(&[
+            0x02, 0x0B, 0x01, 0x03, b'e', b'n', b'v', 0x03, b'l', b'o', b'g', 0x00, 0x00,
+        ]);
+        let module = parse(&bytes).unwrap();
+        assert_eq!(
+            module.imports,
+            vec![Import {
+                module: "env".to_string(),
+                name: "log".to_string(),
+                desc: ImportDesc::Func(0),
+            }]
+        );
+        assert_eq!(module.imported_func_count(), 1);
+    }
+
+    #[test]
+    fn parses_table_memory_and_global_imports_and_keeps_reading_after_them() {
+        let mut bytes = header();
+        bytes.extend_from_slice(&[
+            0x02, 0x18, 0x03, // import section, size 24, 3 imports
+            0x01, b'a', 0x01, b't', 0x01, 0x70, 0x00, 0x01, // "a"."t": table(funcref, limits{min:1})
+            0x01, b'a', 0x01, b'm', 0x02, 0x01, 0x01, 0x02, // "a"."m": memory(limits{min:1,max:2})
+            0x01, b'a', 0x01, b'g', 0x03, 0x7F, 0x01, // "a"."g": global(i32, mutable)
+        ]);
+        let module = parse(&bytes).unwrap();
+        assert_eq!(
+            module.imports,
+            vec![
+                Import { module: "a".to_string(), name: "t".to_string(), desc: ImportDesc::Table },
+                Import { module: "a".to_string(), name: "m".to_string(), desc: ImportDesc::Memory },
+                Import { module: "a".to_string(), name: "g".to_string(), desc: ImportDesc::Global },
+            ]
+        );
+        assert_eq!(module.imported_func_count(), 0);
+    }
+
+    #[test]
+    fn rejects_a_function_import_with_an_out_of_range_type_index() {
+        let mut bytes = header();
+        // no type section, so type index 0 does not exist
+        bytes.extend_from_slice(&[0x02, 0x07, 0x01, 0x01, b'a', 0x01, b'b', 0x00, 0x00]);
+        let idx_offset = bytes.len() - 1;
+        assert_eq!(
+            parse(&bytes),
+            Err(ParseError { offset: idx_offset, kind: ParseErrorKind::TypeIndexOutOfRange(0) })
+        );
+    }
+
+    #[test]
+    fn rejects_an_invalid_import_kind() {
+        let mut bytes = header();
+        bytes.extend_from_slice(&[0x02, 0x06, 0x01, 0x01, b'a', 0x01, b'b', 0x04]); // kind 4 does not exist
+        let kind_offset = bytes.len() - 1;
+        assert_eq!(
+            parse(&bytes),
+            Err(ParseError { offset: kind_offset, kind: ParseErrorKind::InvalidExternKind(4) })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_limits_flag() {
+        let mut bytes = header();
+        bytes.extend_from_slice(&[0x02, 0x07, 0x01, 0x01, b'a', 0x01, b'b', 0x02, 0x02]); // flag 2 is neither 0 nor 1
+        let flag_offset = bytes.len() - 1;
+        assert_eq!(
+            parse(&bytes),
+            Err(ParseError { offset: flag_offset, kind: ParseErrorKind::InvalidLimits })
+        );
+    }
+
+    #[test]
+    fn parses_a_function_section_and_checks_its_type_indices() {
+        let mut bytes = header();
+        bytes.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]); // type 0: () -> ()
+        bytes.extend_from_slice(&[0x03, 0x03, 0x02, 0x00, 0x00]); // function section: two funcs, both type 0
+        let module = parse(&bytes).unwrap();
+        assert_eq!(module.funcs, vec![Func { type_idx: 0 }, Func { type_idx: 0 }]);
+    }
+
+    #[test]
+    fn rejects_a_function_section_entry_with_an_out_of_range_type_index() {
+        let mut bytes = header();
+        bytes.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]); // type 0
+        bytes.extend_from_slice(&[0x03, 0x02, 0x01, 0x01]); // one func, type 1 (does not exist)
+        let idx_offset = bytes.len() - 1;
+        assert_eq!(
+            parse(&bytes),
+            Err(ParseError { offset: idx_offset, kind: ParseErrorKind::TypeIndexOutOfRange(1) })
+        );
+    }
+
+    #[test]
+    fn parses_exports_and_resolves_function_types_through_them() {
+        let mut bytes = header();
+        bytes.extend_from_slice(&[0x01, 0x06, 0x01, 0x60, 0x01, 0x7F, 0x01, 0x7F]); // type 0: (i32) -> i32
+        bytes.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]); // one func, type 0
+        bytes.extend_from_slice(&[0x07, 0x0A, 0x01, 0x06, b's', b'q', b'u', b'a', b'r', b'e', 0x00, 0x00]); // export "square" func 0
+        let module = parse(&bytes).unwrap();
+        assert_eq!(
+            module.exports,
+            vec![Export { name: "square".to_string(), kind: ExternKind::Func, index: 0 }]
+        );
+        assert_eq!(module.export_func("square"), Some(0));
+        assert_eq!(module.export_func("missing"), None);
+        assert_eq!(
+            module.func_type(0),
+            Some(&FuncType { params: vec![ValType::I32], results: vec![ValType::I32] })
+        );
+        assert_eq!(module.describe_exports(), vec!["func square: (i32) -> i32".to_string()]);
+    }
+
+    #[test]
+    fn rejects_an_invalid_export_kind() {
+        let mut bytes = header();
+        bytes.extend_from_slice(&[0x07, 0x05, 0x01, 0x01, b'x', 0x04, 0x00]); // kind 4 does not exist
+        let kind_offset = bytes.len() - 2;
+        assert_eq!(
+            parse(&bytes),
+            Err(ParseError { offset: kind_offset, kind: ParseErrorKind::InvalidExternKind(4) })
+        );
+    }
+
+    #[test]
+    fn parses_a_start_section() {
+        let mut bytes = header();
+        bytes.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]); // type 0
+        bytes.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]); // one func, type 0
+        bytes.extend_from_slice(&[0x08, 0x01, 0x00]); // start: func 0
+        let module = parse(&bytes).unwrap();
+        assert_eq!(module.start, Some(0));
+    }
+
+    #[test]
+    fn imported_functions_occupy_the_low_end_of_the_function_index_space() {
+        let mut bytes = header();
+        bytes.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]); // type 0: () -> ()
+        bytes.extend_from_slice(&[
+            0x02, 0x0B, 0x01, 0x03, b'e', b'n', b'v', 0x03, b'l', b'o', b'g', 0x00, 0x00,
+        ]); // import 0: func, type 0
+        bytes.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]); // local func at index 1, type 0
+        let module = parse(&bytes).unwrap();
+        assert_eq!(module.imported_func_count(), 1);
+        assert_eq!(module.func_type(0), Some(&FuncType { params: vec![], results: vec![] }));
+        assert_eq!(module.func_type(1), Some(&FuncType { params: vec![], results: vec![] }));
+        assert_eq!(module.func_type(2), None);
     }
 }
