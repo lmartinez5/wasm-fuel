@@ -6,15 +6,15 @@
 //! the ordering rule (known section ids must strictly increase; custom
 //! sections are exempt and may appear anywhere, any number of times) and
 //! handing each section's bytes to whatever understands that id. Type,
-//! import, function, export and start sections have real parsers; the code
-//! section is still skipped by length for now, and table/memory/global/
-//! element/data/data-count sections will stay in `skipped_sections`
-//! permanently, since this crate never gives guest code memory or tables.
+//! import, function, export, start and code sections have real parsers;
+//! table/memory/global/element/data/data-count sections will stay in
+//! `skipped_sections` permanently, since this crate never gives guest code
+//! memory or tables.
 
 use std::fmt;
 
 use crate::leb::{self, LebError};
-use crate::types::{Export, ExternKind, Func, FuncType, Import, ImportDesc, ValType};
+use crate::types::{Code, Export, ExternKind, Func, FuncType, Import, ImportDesc, Local, ValType};
 
 /// The maximum section id defined by the binary format (the data-count
 /// section added for bulk memory). Anything past this is not a section this
@@ -24,11 +24,10 @@ const MAX_KNOWN_SECTION_ID: u8 = 12;
 /// The byte that opens every function type: `0x60`.
 const FUNC_TYPE_TAG: u8 = 0x60;
 
+/// The opcode every function body's instruction sequence must end with.
+const END_OPCODE: u8 = 0x0B;
+
 /// A decoded WebAssembly module.
-///
-/// Fields fill in as the parser grows; code section bodies (locals and
-/// instruction bytes) are still missing, so `funcs` only carries each local
-/// function's type index so far.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Module {
     /// The type section: every function signature the module declares or
@@ -40,6 +39,9 @@ pub struct Module {
     /// function, in declaration order. Function indices count imported
     /// functions first, then these.
     pub funcs: Vec<Func>,
+    /// The code section: one entry per entry in `funcs`, in the same order,
+    /// carrying that function's locals and raw instruction bytes.
+    pub code: Vec<Code>,
     /// The export section, in declaration order.
     pub exports: Vec<Export>,
     /// The start function's index, if the module declares one.
@@ -159,6 +161,12 @@ pub enum ParseErrorKind {
     /// A type index named by an import or the function section named a type
     /// that does not exist.
     TypeIndexOutOfRange(u32),
+    /// The code section declared a different number of entries than the
+    /// function section did; the two must match one-to-one.
+    CodeFuncCountMismatch { code: u32, funcs: u32 },
+    /// A function body's instruction bytes did not end with the `end`
+    /// opcode (`0x0B`) at the position its declared size says they should.
+    CodeBodyMissingEnd,
 }
 
 impl fmt::Display for ParseErrorKind {
@@ -187,6 +195,13 @@ impl fmt::Display for ParseErrorKind {
             }
             ParseErrorKind::InvalidUtf8 => f.write_str("custom section name is not valid UTF-8"),
             ParseErrorKind::TypeIndexOutOfRange(idx) => write!(f, "type index {idx} is out of range"),
+            ParseErrorKind::CodeFuncCountMismatch { code, funcs } => write!(
+                f,
+                "code section has {code} entries but the function section declared {funcs}"
+            ),
+            ParseErrorKind::CodeBodyMissingEnd => {
+                f.write_str("function body does not end with the `end` opcode (0x0B)")
+            }
         }
     }
 }
@@ -274,6 +289,7 @@ pub fn parse(bytes: &[u8]) -> Result<Module, ParseError> {
                     3 => module.funcs = parse_function_section(body, body_start, &module.types)?,
                     7 => module.exports = parse_export_section(body, body_start)?,
                     8 => module.start = Some(parse_start_section(body, body_start)?),
+                    10 => module.code = parse_code_section(body, body_start, &module.funcs)?,
                     _ => module.skipped_sections.push(id),
                 }
             }
@@ -478,6 +494,62 @@ fn parse_start_section(body: &[u8], base: usize) -> Result<u32, ParseError> {
         return Err(ParseError { offset: base + pos, kind: ParseErrorKind::SectionSizeMismatch });
     }
     Ok(index)
+}
+
+/// Decodes the code section: `vec(code)`, one entry per locally defined
+/// function, in the same order as the function section. Each entry is
+/// `size:u32 locals:vec(localgroup) expr:byte*`, where `size` covers both
+/// `locals` and `expr` and `localgroup` is `n:u32 t:valtype` (`n` locals of
+/// type `t`). `expr` is not decoded into instructions here - it is kept as
+/// raw bytes for the interpreter - but its last byte is checked against the
+/// `end` opcode, since a body that does not end in `end` is malformed no
+/// matter what the bytes before it mean.
+fn parse_code_section(body: &[u8], base: usize, funcs: &[Func]) -> Result<Vec<Code>, ParseError> {
+    let mut pos = 0;
+    let count = read_u32_at(body, &mut pos, base)?;
+    if count as usize != funcs.len() {
+        return Err(ParseError {
+            offset: base,
+            kind: ParseErrorKind::CodeFuncCountMismatch { code: count, funcs: funcs.len() as u32 },
+        });
+    }
+    let mut code = Vec::with_capacity(count as usize);
+
+    for _ in 0..count {
+        let entry_size = read_u32_at(body, &mut pos, base)? as usize;
+        let entry_start = pos;
+        let entry_end = entry_start
+            .checked_add(entry_size)
+            .filter(|&end| end <= body.len())
+            .ok_or(ParseError { offset: base + body.len(), kind: ParseErrorKind::UnexpectedEof })?;
+
+        let local_group_count = read_u32_at(body, &mut pos, base)?;
+        let mut locals = Vec::with_capacity(local_group_count as usize);
+        for _ in 0..local_group_count {
+            let group_count = read_u32_at(body, &mut pos, base)?;
+            let type_offset = base + pos;
+            let type_byte = read_byte(body, &mut pos, base)?;
+            let val_type = ValType::from_byte(type_byte)
+                .ok_or(ParseError { offset: type_offset, kind: ParseErrorKind::InvalidValType(type_byte) })?;
+            locals.push(Local { count: group_count, val_type });
+        }
+
+        if pos > entry_end {
+            return Err(ParseError { offset: base + entry_end, kind: ParseErrorKind::SectionSizeMismatch });
+        }
+        let instrs = &body[pos..entry_end];
+        if instrs.last() != Some(&END_OPCODE) {
+            return Err(ParseError { offset: base + entry_end, kind: ParseErrorKind::CodeBodyMissingEnd });
+        }
+        code.push(Code { locals, body: instrs.to_vec() });
+        pos = entry_end;
+    }
+
+    if pos != body.len() {
+        return Err(ParseError { offset: base + pos, kind: ParseErrorKind::SectionSizeMismatch });
+    }
+
+    Ok(code)
 }
 
 /// Decodes a custom section's name: `vec(byte)` interpreted as UTF-8. Any
@@ -869,5 +941,78 @@ mod tests {
         assert_eq!(module.func_type(0), Some(&FuncType { params: vec![], results: vec![] }));
         assert_eq!(module.func_type(1), Some(&FuncType { params: vec![], results: vec![] }));
         assert_eq!(module.func_type(2), None);
+    }
+
+    #[test]
+    fn parses_a_code_section_entry_with_locals_and_body_bytes() {
+        let mut bytes = header();
+        bytes.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]); // type 0: () -> ()
+        bytes.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]); // one func, type 0
+        bytes.extend_from_slice(&[
+            0x0A, 0x08, // code section, size 8
+            0x01, // one entry
+            0x06, // entry size: 6 bytes follow
+            0x01, 0x02, 0x7F, // one local group: 2 x i32
+            0x41, 0x00, 0x0B, // body: i32.const 0, end
+        ]);
+        let module = parse(&bytes).unwrap();
+        assert_eq!(
+            module.code,
+            vec![Code { locals: vec![Local { count: 2, val_type: ValType::I32 }], body: vec![0x41, 0x00, 0x0B] }]
+        );
+    }
+
+    #[test]
+    fn rejects_a_code_section_whose_entry_count_does_not_match_the_function_section() {
+        let mut bytes = header();
+        bytes.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]); // type 0
+        bytes.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]); // one func, type 0
+        let code_body_start = bytes.len() + 2;
+        bytes.extend_from_slice(&[0x0A, 0x01, 0x00]); // code section, size 1, zero entries
+        assert_eq!(
+            parse(&bytes),
+            Err(ParseError {
+                offset: code_body_start,
+                kind: ParseErrorKind::CodeFuncCountMismatch { code: 0, funcs: 1 },
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_a_function_body_that_does_not_end_with_the_end_opcode() {
+        let mut bytes = header();
+        bytes.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]); // type 0
+        bytes.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]); // one func, type 0
+        bytes.extend_from_slice(&[
+            0x0A, 0x04, // code section, size 4
+            0x01, // one entry
+            0x02, // entry size: 2 bytes follow
+            0x00, // no locals
+            0x01, // body: a single byte that is not 0x0B
+        ]);
+        let entry_end = bytes.len();
+        assert_eq!(
+            parse(&bytes),
+            Err(ParseError { offset: entry_end, kind: ParseErrorKind::CodeBodyMissingEnd })
+        );
+    }
+
+    #[test]
+    fn rejects_a_code_entry_whose_locals_overrun_its_declared_size() {
+        let mut bytes = header();
+        bytes.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]); // type 0
+        bytes.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]); // one func, type 0
+        let entry_end = bytes.len() + 5; // right after the entry's declared 1-byte content
+        bytes.extend_from_slice(&[
+            0x0A, 0x05, // code section, size 5
+            0x01, // one entry
+            0x01, // entry size: 1 byte, but the local group below needs 3
+            0x01, // one local group (fits within the declared size)
+            0x02, 0x7F, // group count and type (do not fit; read past entry_end)
+        ]);
+        assert_eq!(
+            parse(&bytes),
+            Err(ParseError { offset: entry_end, kind: ParseErrorKind::SectionSizeMismatch })
+        );
     }
 }

@@ -134,11 +134,31 @@ pub struct Import {
 }
 
 /// A locally defined function, as declared in the function section: just the
-/// type index for now. Locals and the instruction bytes arrive with the code
-/// section.
+/// type index. Its locals and instruction bytes live separately, in the code
+/// section's matching `Code` entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Func {
     pub type_idx: u32,
+}
+
+/// One local declaration group within a function body: `count` locals, all
+/// of type `val_type`. The binary format run-length encodes locals this way
+/// rather than listing each one, since a function's locals are usually a
+/// handful of types repeated many times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Local {
+    pub count: u32,
+    pub val_type: ValType,
+}
+
+/// A function body from the code section: its local declarations and the
+/// raw bytes of its instruction sequence (the `expr`, including the
+/// terminating `0x0B` end opcode). Decoding those bytes into anything
+/// executable is the interpreter's job, not the parser's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Code {
+    pub locals: Vec<Local>,
+    pub body: Vec<u8>,
 }
 
 /// A single entry from the export section: the name it is visible under,
